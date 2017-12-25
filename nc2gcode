@@ -1,0 +1,171 @@
+#! /usr/bin/python
+
+# converts MakerCAM .nc output to gcode suitable for Marlin.
+# all G0, G1, G2, and G3 moves are converted to relative positioning.
+# We assume that the initial position is at the surface (Z=0).
+
+# F3000 (or --f_move value) is used for the repositioning G0/G1 moves.
+# For down (Z<0) G0/G1 movements, the part above the Z=0 plane is treated as
+# move, the part below is treated as mill. Up movements (Z>0) are treated as
+# moves.
+#
+# Moves back to the initial point and switches back to absolute
+# positioning at the end.
+
+#  usage: nc2gcode [--f_move feedrate] [--help] [-h] infile [outfile]
+
+# by Nenad Rijavec
+# Feel free to use, share and modify as you see fit.
+
+import sys, getopt, argparse
+import os
+import math
+
+curr_pos = [0, 0, 0 ]
+coords = [ 'X', 'Y', 'Z' ]
+
+# gets the value of a coordinate in a command, if the coordinate is present
+def read_val( line, selector ):
+	global coords
+
+	val_loc = line.find(coords[selector])
+	if val_loc == -1:
+		return 0.0
+	else:
+		space_loc = line[val_loc+1:len(line)].find( ' ' )
+		if space_loc == -1:
+			space_loc = len(line)+1
+		else:
+			space_loc = space_loc + val_loc + 1
+		return float( line[ val_loc+1:space_loc] )
+
+# same as read_val, but the value is given as string
+def read_str_val( line, selector ):
+	global coords
+
+	val_loc = line.find(coords[selector])
+	if val_loc == -1:
+		return 0.0
+	else:
+		space_loc = line[val_loc+1:len(line)].find( ' ' )
+		if space_loc == -1:
+			space_loc = len(line)+1
+		else:
+			space_loc = space_loc + val_loc + 1
+		return line[ val_loc+1:space_loc]
+
+# converts the specified component (X, Y or Z) to relative movement
+
+def to_relative(line, selector):
+	global coords
+	global curr_pos
+
+	if line.find( coords[selector] ) < 0:
+		return line # nothing to do
+	
+	nbr = read_str_val( line, selector )
+	new_pos = float( nbr )
+	nbr1=str(new_pos-curr_pos[selector])
+	curr_pos[selector] = new_pos
+	return line.replace( coords[selector]+nbr, coords[selector]+nbr1 )
+
+parser = argparse.ArgumentParser()
+
+parser.add_argument("infile", help="input .nc gcode file name")
+parser.add_argument("outfile", nargs='?', \
+	help="output gcode file name, computed from input file if absent")
+parser.add_argument("--f_move", default="F3000", \
+			help="move F speed, default=3000mm/min" )
+
+args=parser.parse_args()
+feedrate = args.f_move
+
+if args.outfile != None > 2:
+	outfile = args.outfile
+else:
+	outfile = args.infile.replace( ".nc", ".gcode" )
+
+
+ncfile = open( args.infile, 'r' )
+gfile = open( outfile, 'w' )
+
+# write comments into the G code
+gfile.write( "; Marlin-compatible gcode converted from MakerCAM .nc gcode\n\n")
+gfile.write( "; All the coordinates are relative to the starting point\n\n")
+
+# preamble
+
+gfile.write( "G21\n" )
+gfile.write( "G91\n" )
+
+safe_z = -1.0
+
+#loop over infile
+for line in ncfile:
+	if  line.find( "G0 " )==0 or line.find( "G1 " )==0 or \
+		line.find( "G2 " )==0 or line.find( "G3 " )==0 :
+		have_z = False
+		if line.find("Z") > -1:
+			# Z coordinate is present
+			have_z = True
+			z = read_val( line, 2 )
+			if safe_z < 0:
+				safe_z = z
+			if z < 0 and curr_pos[2] > 0 and \
+					line.find('X') < 0 and \
+					line.find('Y') < 0:
+				# Z-only downward, break out move from mill
+				gfile.write( line[0:2] + \
+					" Z-" + str( curr_pos[2] ) + \
+					" " + feedrate + '\n' )
+				curr_pos[2] = 0
+		rel_line = \
+		to_relative( to_relative( to_relative( line, 0 ), 1 ), 2 )
+		z = read_val( rel_line, 2 ) 
+		F_loc = rel_line.find("F")
+		# upward Z is assumed move
+		if z > 0 and \
+			(line.find( "G0" ) > -1 or line.find( "G1 " ) > -1):
+			if F_loc < 0:
+				gfile.write( rel_line.rstrip() + \
+					" " + feedrate + '\n' ) 
+			else:
+				gfile.write( rel_line[0:F_loc] + \
+					" " + feedrate + '\n' )
+		# no Z component, assumed move if at safe_z or higher
+		elif not have_z and curr_pos[2] >= safe_z and \
+			(line.find( "G0" ) > -1 or line.find( "G1 " ) > -1):
+			if F_loc < 0:
+				gfile.write( rel_line.rstrip() + \
+					" " + feedrate + '\n' ) 
+			else:
+				gfile.write( rel_line[0:F_loc] + \
+					" " + feedrate + '\n' )
+		else:
+			gfile.write( rel_line.strip() + '\n' ) 
+	# MakerCAM comments to G-code comments 
+	elif line.find("(") != -1:
+		gfile.write( "; " + line.rstrip() + '\n' ) 
+	# skip G21 command line and any empty lines
+	elif line.find("G21 ") == -1 and len(line.strip()) > 0:
+		gfile.write( line.strip() + '\n' ) 
+
+# end ops
+
+gfile.write( '\n' )
+
+z = curr_pos[2] - safe_z
+if z > 0.01: # move to safe height
+	gfile.write( "G0 Z" + str( z ) + " " + feedrate + '\n' )
+gfile.write( "G0 X" + str(-curr_pos[0]) + " Y" + str(-curr_pos[1]) )
+gfile.write( " " + feedrate + " ; position back to the starting point\n" )
+gfile.write( "G0 Z-" + str( safe_z ) + " " + feedrate + " ; back to surface\n" ) 
+gfile.write( '\n' )
+
+gfile.write( "G90 ; switch back to absolute" + os.linesep )
+
+gfile.flush()
+gfile.close()
+ncfile.close()
+
+# nenad me fecit

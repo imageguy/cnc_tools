@@ -1,0 +1,32 @@
+#! /bin/bash
+
+# converts Inkscape ngc output to regular gcode for Marlin. Z is changed to
+# 0 from -0.125. Explicit absolute positioning (G90) is prepended.
+
+if [ $# -lt 1 ]
+then
+	echo usage: $0 infile '[ outfile] '
+	exit 1  
+elif [ $# -lt 2 ]
+then
+	infile=$1
+	outfile=`basename $1 ngc`gcode
+else
+	infile=$1
+	outfile=$2
+fi
+
+echo $infile, $outfile
+
+echo G90 > $outfile
+
+cat $infile \
+	| sed -e "s/%//" \
+	| sed -e "s/(.*)//" \
+	| sed -e "s/Z-0.125/Z0./" \
+	| grep -v M2 \
+	| grep -v M3 \
+	| grep -v M5 \
+	| grep -v 'G00 X0.0000 Y0.0000' \
+	| grep -v '^$' \
+	>> $outfile

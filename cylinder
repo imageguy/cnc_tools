@@ -1,0 +1,129 @@
+#! /usr/bin/python
+
+#  usage: cylinder [options] outfile diam depth tool_diam 
+#  assume we start at the surface, at the center of the circle
+#  at the end, the tool returns to the starting point, position is left as
+#  absolute, units are left in mm.
+
+import sys, getopt, argparse
+import os
+import math
+
+parser = argparse.ArgumentParser()
+
+parser.add_argument("outfile", help="output gcode file name")
+parser.add_argument("diam", help="cylinder diameter")
+parser.add_argument("depth", help="cylinder depth")
+parser.add_argument("tool_diam", help="tool diameter")
+parser.add_argument("--f_horiz", default="50",
+	help="horizontal feed rate, default=50mm/min")
+parser.add_argument("--f_vert", default="10",
+	help="vertical feed rate, default=10mm/min")
+parser.add_argument("--z_step", default=0.2, 
+	help="vertical step, default=0.2mm")
+parser.add_argument("--move_h", default="10", 
+	help="safe height for lateral moves, default=10mm")
+parser.add_argument("--move_f", default="1000", 
+	help="feed rate for moves, default=1000mm/min")
+parser.add_argument("--overlap", default=0.5, 
+	help="tool overlap fraction, default=0.5")
+parser.add_argument("--full", action='store_true',
+	help="remove cylinder interior")
+
+args=parser.parse_args()
+
+#print "outfile=" + args.outfile
+#print "diam=" + args.diam
+#print "depth=" + args.depth
+#print "tool_diam=" + args.tool_diam
+#print "f_horiz=" + args.f_horiz
+#print "f_vert=" + args.f_vert
+#print "z_step=" + str(args.z_step)
+#print "full=" + str(args.full)
+
+eff_r = str((float(args.diam) - float(args.tool_diam))/2)
+n_layers = int(math.ceil( float(args.depth)/float(args.z_step) ))
+
+
+if args.full:
+	eff_tool_diam = float(args.tool_diam) * (1-float(args.overlap))
+	n_concentric= int(math.ceil(float(args.diam)/(2*eff_tool_diam)))
+	tot_move = eff_tool_diam * (n_concentric-2)
+else:
+	eff_tool_diam = 0
+	n_concentric = 1
+	tot_move = 0
+
+print str(n_layers) + " layers"
+if args.full:
+	print str(n_concentric-1) + " concentrics"
+else:
+	print "perimeter only"
+
+gfile = open( args.outfile, 'w' )
+
+# write comments into the G code
+gfile.write( "; cylinder" + os.linesep )
+gfile.write( "; starts in the center on material surface" + os.linesep )
+gfile.write( "; to the same spot at the end" + os.linesep )
+gfile.write( "; on exit, the units are mm and positioning is absolute" +
+		os.linesep )
+if args.full:
+	gfile.write( "; whole cylinder is removed" + os.linesep )
+else:
+	gfile.write( "; just the perimeter is removed" + os.linesep )
+gfile.write( "; diam = " + args.diam + os.linesep )
+gfile.write( "; depth = " + args.depth + os.linesep )
+gfile.write( "; tool diam = " + args.tool_diam + os.linesep )
+gfile.write( "; z_step = " + str(args.z_step) + os.linesep )
+gfile.write( "; f_horiz = " + args.f_horiz + os.linesep )
+gfile.write( "; f_vert = " + args.f_vert + os.linesep )
+gfile.write( "; overlap = " + str(args.overlap) + os.linesep )
+gfile.write( "; move_h = " + args.move_h + os.linesep )
+gfile.write( "; move_f = " + args.move_f + os.linesep )
+gfile.write( "; there are " + str(n_layers) + " layers" + os.linesep )
+gfile.write( os.linesep )
+
+# actual working G code generated below
+gfile.write( "G21 ; switch to millimeters"+os.linesep )
+gfile.write( "G91 ; switch to relative"+os.linesep )
+gfile.write( "G1 Z" + args.move_h + " F" + args.move_f + os.linesep ) # raise to safe height
+gfile.write( "G1 X-" + eff_r + " F" + args.move_f + os.linesep ) # from center to left edge
+gfile.write( "G1 Z-" + args.move_h + " F" + args.move_f + os.linesep ) # lower back to surface
+
+for i in range(n_layers):
+	gfile.write( "G1 Z-" + str(args.z_step) + " F" + args.f_vert + os.linesep ) 
+	curr_r = float(eff_r)
+	while curr_r > 0:
+		r = str(curr_r)
+		gfile.write( "G2" +
+			" X" + r + " Y" + r + " I" + r + " J0" +
+			" F" + args.f_horiz + os.linesep )
+		gfile.write( "G2" +
+			" X" + r + " Y-" + r + " I0" + " J-" + r + 
+			os.linesep )
+		gfile.write( "G2" +
+			" X-" + r + " Y-" + r + " I-" + r + " J0" +
+			os.linesep )
+		gfile.write( "G2" +
+			" X-" + r + " Y" + r + " I0" + " J" + r +
+			os.linesep )
+		# go to the next circle if full
+		if args.full and curr_r > eff_tool_diam:
+			curr_r -= eff_tool_diam
+			gfile.write( "G1 X" + str(eff_tool_diam) +
+			os.linesep )
+		else:
+			curr_r = 0
+	# back to the left edge
+	if tot_move > 0:
+		gfile.write( "G1 X-" + str(tot_move) + os.linesep )
+
+gfile.write( "G1 Z" + args.depth + " F" + args.move_f + os.linesep ) # raise up to surface
+gfile.write( "G1 Z" + args.move_h + " F" + args.move_f + os.linesep ) # raise to safe height
+gfile.write( "G1 X+" + eff_r + " F" + args.move_f + os.linesep ) # from left edge back to center
+gfile.write( "G1 Z-" + args.move_h + " F" + args.move_f + os.linesep ) # lower back to surface
+gfile.write( "G90 ; switch back to absolute"+os.linesep )
+
+gfile.flush()
+gfile.close()

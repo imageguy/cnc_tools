@@ -1,0 +1,480 @@
+#! /usr/bin/python
+
+# Modifies SVG file produced by Fritzing to change radius of selected
+# circles and line width of selected lines. The circle center and the line
+# position remain unchanged. It can also reorder the items so that selected 
+# circles are sorted at the end and appear on top. Selection is by color,
+# specified as a hex RGB number, with the default being red (ff0000).
+
+# pcbsvg --help or pcbsvg -h gives usage.
+
+# By Nenad Rijavec
+# Feel free to use, share or modify as you see fit.
+
+import sys, getopt, argparse
+import os
+import math
+
+# utility functions
+
+# generic to get a numeric value from a tag="number" entry
+def get_entry_num( buff ):
+	pos = buff.find("\"")
+	pos2 = pos + 1 + buff[pos+1:].find("\"")
+	return float( buff[pos+1:pos2] )
+
+# generic to get a string value from a tag="string" entry
+def get_entry_str( buff ):
+	pos = buff.find("\"")
+	pos2 = pos + 1 + buff[pos+1:].find("\"")
+	return buff[pos+1:pos2]
+
+# inkscape packages multiple items into a "style" entry. This unpacks them.
+def unpack_style( buff ):
+	buff = buff.replace( ";", "\" " )
+	buff = buff.replace( ":", "=\"" )
+	pos = buff.find( "\"" )
+	entries = buff[pos+1:].split()
+	return entries
+
+# sets up operations based on the call arguments
+class item_ops( object ):
+	def __init__(self, args):
+		if args.line_w == None and args.diam == None and \
+				not args.reorder and not args.extract:
+			sys.exit( "at least one of --line_w, --diam, \
+--reorder must be given" )
+		if args.line_w == None:
+			self.line_w = -1.0
+		else:
+			self.line_w = float(args.line_w)
+		if args.diam == None:
+			self.r = -1.0
+		else:
+			self.r = 0.5 * float(args.diam)
+		self.reorder = args.reorder
+		self.color = "#" + args.color
+
+# SVG item classes
+
+#  basic, no data elements, no children
+class Item(object):
+	def __init__(self):
+		self.preamble = None
+		self.trailer = None
+		self.prev = None
+		self.next = None
+		self.parent = None
+		self.tag = None
+		self.selected = False
+	def parse(self, base, buff, tag, do_buff, ops ):
+		if buff.find( ops.color ) > -1:
+			self.selected = True
+		if do_buff:
+			self.preamble = buff
+		self.tag = tag
+		if base != None:
+			if base.__class__.__name__ == "Group":
+				self.parent = base
+				if base.children == None:
+					base.children = self
+				else:
+					base = base.children
+					while base.next != None:
+						base = base.next
+					base.append(self)
+			else:
+				base.append(self)
+				self.parent = base.parent
+	def output(self,outfile):
+		outfile.write(self.preamble)
+	def append(self,next):
+		self.next = next
+		next.prepend(self)
+	def prepend( self, prev):
+		self.prev = prev
+	def progress(self):
+		if self.parent != None and self.next == None:
+			return self.parent.next
+		else:
+			return self.next
+	def modify(self, ops ):
+		pass
+
+class Group(Item):
+	def __init__(self):
+		Item.__init__(self)
+		self.children = None
+	def progress(self):
+		if  self.children != None:
+			return self.children
+		elif self.parent != None and self.next == None:
+			return self.parent.next
+		else:
+			return self.next
+
+class EndGroup(Item):
+	def __init__(self):
+		Item.__init__(self)
+	def parse(self, base, buff, tag, do_buff, color ):
+		if buff.find( ops.color ) > -1:
+			self.selected = True
+		self.preamble = buff
+		base = base.parent
+		base.append(self)
+		self.parent = base.parent
+
+class Line(Item):
+	def __init__(self):
+		Item.__init__(self)
+		self.entries = None
+		self.stroke_w = -1.0
+	def parse(self, base, buff, tag, do_buff, ops ):
+		Item.parse(self, base, buff, tag, False, ops)
+		pos = buff.find("<")
+		if pos > 0:
+			pos2 = pos+1
+			while not buff[pos2].isspace():
+				pos2 = pos2 + 1
+			if pos2 - pos == 1:
+				while buff[pos2].isspace:
+					pos2 = pos2 + 1
+				while not buff[pos2].isspace:
+					pos2 = pos2 + 1
+			pos = pos2
+			self.preamble = buff[:pos]
+		self.entries = buff[pos:].split()
+		style_ind = -1
+		for i in range(0,len(self.entries)):
+			if self.entries[i].find( "style" ) > -1:
+				style_ind = i
+		if style_ind > -1:
+			self.entries = self.entries[0:style_ind] + \
+				unpack_style( self.entries[style_ind] ) +\
+				self.entries[style_ind+1:]
+		# eliminate duplicates
+		for i in range(0,len(self.entries)):
+			curr_name = \
+				self.entries[i][:self.entries[i].find("=")+1]
+			for j in range( i+1,len(self.entries)):
+				if self.entries[j] != None:
+					if self.entries[j].find(curr_name) > -1:
+						self.entries[i] = None
+		#process entries
+		for i in range(0,len(self.entries)):
+			if self.entries[i] != None:
+				if self.entries[i].find( "/>" ) > -1:
+					if self.entries[i] != "/>":
+						self.entries[i] = self.entries[i][:self.entries[i].find("/<")-1]
+						if self.trailer != None:
+							self.trailer = self.trailer + \
+								" " + "/>"
+						else:
+							self.trailer = "/>"
+				elif self.entries[i] != ">" and self.entries[i].find( ">" ) > -1:
+					self.entries[i] = self.entries[i][:self.entries[i].find("<")-1]
+					if self.trailer != None:
+						self.trailer = self.trailer + \
+							" " + ">"
+					else:
+						self.trailer = ">"
+				if self.entries[i].find( "stroke=" ) > -1:
+					if self.entries[i].find( ops.color ) >-1:	
+						self.selected = True
+					else:
+						self.selected = False
+				if self.entries[i].find( "stroke-width" ) > -1:
+					self.stroke_w = get_entry_num(self.entries[i]) 
+					self.entries[i] = None
+	def output(self,outfile):
+		outfile.write(self.preamble)
+		if self.stroke_w > -1.0:
+			outfile.write(" stroke-width=\"" + \
+				str(self.stroke_w) + "\" ")
+		first = True
+		for entry in self.entries:
+			if first and entry != None:
+				first = False
+				outfile.write( entry )
+			elif entry != None:
+				outfile.write( " " + entry )
+		if self.trailer != None:
+			outfile.write(" " + self.trailer)
+	def modify(self, ops ):
+		if self.selected and ops.line_w > 0:
+			self.stroke_w = ops.line_w
+
+class Circle(Item):
+	def __init__(self):
+		Item.__init__(self)
+		self.stroke_w = -1.0
+		self.r = -1.0
+	def parse(self, base, buff, tag, do_buff, ops ):
+		Item.parse(self, base, buff, tag, False, ops)
+		pos = buff.find("<")
+		if pos > 0:
+			pos2 = pos+1
+			while not buff[pos2].isspace():
+				pos2 = pos2 + 1
+			if pos2 - pos == 1:
+				while buff[pos2].isspace:
+					pos2 = pos2 + 1
+				while not buff[pos2].isspace:
+					pos2 = pos2 + 1
+			pos = pos2
+			self.preamble = buff[:pos]
+		self.entries = buff[pos:].split()
+		style_ind = -1
+		for i in range(0,len(self.entries)):
+			if self.entries[i].find( "style" ) > -1:
+				style_ind = i
+		if style_ind > -1:
+			self.entries = self.entries[0:style_ind] + \
+				unpack_style( self.entries[style_ind] ) +\
+				self.entries[style_ind+1:]
+		# eliminate duplicates
+		for i in range(0,len(self.entries)):
+			curr_name = \
+				self.entries[i][:self.entries[i].find("=")+1]
+			for j in range( i+1,len(self.entries)):
+				if self.entries[j] != None:
+					if self.entries[j].find(curr_name) > -1:
+						self.entries[i] = None
+		for i in range(0,len(self.entries)):
+			if self.entries[i] != None:
+				if self.entries[i].find( "/>" ) > -1:
+					if self.entries[i] != "/>":
+						self.entries[i] = self.entries[i][:self.entries[i].find("/<")-1]
+						if self.trailer != None:
+							self.trailer = self.trailer + \
+								" " + "/>"
+						else:
+							self.trailer = "/>"
+				elif self.entries[i] != ">" and self.entries[i].find( ">" ) > -1:
+					self.entries[i] = self.entries[i][:self.entries[i].find("<")-1]
+					if self.trailer != None:
+						self.trailer = self.trailer + \
+							" " + ">"
+					else:
+						self.trailer = ">"
+				if self.entries[i].find( "stroke-width" ) > -1:
+					self.stroke_w = get_entry_num(self.entries[i]) 
+					self.entries[i] = None
+				elif self.entries[i][0] == 'r' and \
+					self.entries[i][1] == '=':
+					self.r = get_entry_num(self.entries[i]) 
+					self.entries[i] = None
+				pass
+	def output(self,outfile):
+		outfile.write(self.preamble)
+		if self.stroke_w > -1.0:
+			outfile.write(" stroke-width=\"" + \
+				str(self.stroke_w) + "\" ")
+		if self.r > -1.0:
+			outfile.write(" r=\"" + \
+				str(self.r) + "\" ")
+		first = True
+		for entry in self.entries:
+			if first and entry != None:
+				first = False
+				outfile.write( entry )
+			elif entry != None:
+				outfile.write( " " + entry )
+		if self.trailer != None:
+			outfile.write(" " + self.trailer)
+	def modify(self, ops ):
+		if self.selected and ops.r > -1:
+			self.r = ops.r - self.stroke_w/2
+	def mkopaque( self ):
+		for i in range( 0, len(self.entries) ):
+			if self.entries[i] != None and \
+				self.entries[i].find("fill") > -1:
+				self.entries[i] = "fill=\"#ffffff\""
+
+# makes the right item class based on the tag
+
+def mkitem( curr, buff, ops ):
+	tag= buff[:30].strip()[1:].split()[0]
+	if tag[len(tag)-1] == ">":
+		tag = tag[:len(tag)-1]
+	if tag == "g":
+		wrk = Group()
+	elif tag == "line":
+		wrk = Line()
+	elif tag == "circle":
+		wrk = Circle()
+	elif tag == "/g":
+		wrk = EndGroup()
+	else:
+		wrk = Item()
+	wrk.parse(curr,buff, tag, True, ops)
+	return wrk
+
+# factor to scale mm to svg units since interface is in mm
+def unit_scale_fac( unit ):
+	if unit == "mm":
+		return 1.0
+	elif unit == "cm":
+		return 10.0
+	elif unit == "in":
+		return 25.4
+	elif unit == "pc":
+		return 4.233
+	elif unit == "pt":
+		return 0.353
+	elif unit == "px":
+		return 0.265
+
+# harvests user units to mm scale factor from a viewBox
+def get_scale_fac( curr ):
+	# this errors out if svg tag is missing
+	while curr.tag != "svg":
+		curr = curr.next
+	# get viewBox dims in user units
+	pos = curr.preamble.find("viewBox")
+	pos = pos + curr.preamble[pos:].find("\"")
+	pos2 = pos + 1 + curr.preamble[pos+1:].find("\"")
+	nums = curr.preamble[pos+1:pos2].split()
+	user_w = float(nums[2]) - float(nums[0])
+	user_h = float(nums[3]) - float(nums[1])
+	# svg units: get unit and dimension in each direction
+	pos = curr.preamble.find("width")
+	pos = pos + curr.preamble[pos:].find("\"")
+	pos2 = pos + 1
+	while curr.preamble[pos2].isdigit() or curr.preamble[pos2] == '.':
+		pos2 = pos2 + 1
+	svg_w = float(curr.preamble[pos+1:pos2-1]) 
+	pos = pos2
+	pos2 = pos + 1 + curr.preamble[pos+1:].find("\"")
+	scale_w = unit_scale_fac( curr.preamble[pos:pos2] )
+	pos = curr.preamble.find("height")
+	pos = pos + curr.preamble[pos:].find("\"")
+	pos2 = pos + 1
+	while curr.preamble[pos2].isdigit() or curr.preamble[pos2] == '.':
+		pos2 = pos2 + 1
+	svg_h = float(curr.preamble[pos+1:pos2-1]) 
+	pos = pos2
+	pos2 = pos + 1 + curr.preamble[pos+1:].find("\"")
+	scale_h = unit_scale_fac( curr.preamble[pos:pos2] )
+	scale_w = user_w / ( svg_w * scale_w )
+	scale_h = scale_h * (svg_w / user_h )
+	return ( scale_w, scale_h )
+
+# done with the preamble, main code starts here
+
+parser = argparse.ArgumentParser()
+
+parser.add_argument("infile", help="input .svg file name")
+parser.add_argument("outfile", help="output .svg file name")
+parser.add_argument("--line_w", nargs='?', help="new line width in mm")
+parser.add_argument("--diam", nargs='?', help="new circle diameter in mm")
+parser.add_argument("--reorder", action="store_true", \
+		help="reorder selected circles to the end" )
+parser.add_argument("--color", default="ff0000", help="selected item color")
+
+args=parser.parse_args()
+
+ops = item_ops( args )
+
+infile = open( args.infile, 'r' )
+
+buff = infile.read()
+
+pos = 0
+endpos = len(buff)
+root = None
+
+# build the tag tree
+while pos < endpos :
+	next_pos = buff[pos:].find("<")
+	if next_pos >= 0:
+		enditem = buff[pos+next_pos:].find(">") + 1 
+		if root == None:
+			tag= buff[:30].strip()[1:].split()[0]
+			if tag[len(tag)-1] == ">":
+				tag = tag[:len(tag)-1]
+			root = Item()
+			root.parse( None,
+			buff[pos:pos+next_pos+enditem],tag, True, ops)
+			curr = root 
+		else:
+			curr = mkitem( curr, buff[pos:pos+next_pos+enditem], ops)
+		pos = pos + next_pos + enditem 
+		if buff[pos].isspace():
+			pos = pos + 1
+	else:
+		pos = endpos
+
+# get the scaling values
+# X-direction scale is used, Y direction is assumed the same and ignored
+
+( scale_w, scale_h ) = get_scale_fac(root)
+ops.line_w = scale_w * ops.line_w
+ops.r = scale_w * ops.r
+
+# modify the item values
+curr = root
+while curr != None:
+	curr.modify( ops )
+	curr = curr.progress()
+
+# reorder the selected circles to the end, if desired
+
+last = None
+curr_circ = None
+reordered = False
+
+if ops.reorder:
+	curr = root
+	circles = None
+	while curr != None and curr.preamble.find("</svg") < 0:
+		if curr.__class__.__name__ == "Group":
+			sys.exit( "can't reorder SVG containing grups." )
+		if curr.next == None:
+			last = curr
+		elif curr.next.preamble.find("</svg") > -1:
+			last = curr.next
+		if curr.__class__.__name__ == "Circle" and curr.selected:
+			curr.mkopaque()
+			if circles == None:
+				circles = curr
+				curr_circ = curr
+				curr.next.prev = curr.prev
+				curr.prev.next = curr.next
+				curr = curr.next
+				circles.prev = None
+				circles.next = None
+			else:
+				curr_circ.next = curr
+				curr.next.prev = curr.prev
+				curr.prev.next = curr.next
+				curr.prev = curr_circ
+				curr = curr.next
+				curr_circ.next.next = None
+				curr_circ.next.prev = curr_circ
+				curr_circ = curr_circ.next
+		else:
+			curr = curr.next
+	if curr_circ != None:
+		print "reordered"
+		curr_circ.next = last
+		last.prev.next = circles
+	else:
+		print "no circles were selected for reordering"
+
+# output the modified tag tree
+outfile = open( args.outfile, 'w' )
+curr = root
+while curr != None:
+	curr.output( outfile ) 
+	outfile.write( "\n" )
+	curr = curr.progress()
+
+outfile.flush()
+outfile.close()
+infile.close()
+
+sys.exit( 0 )
+
+
+# nenad me fecit
