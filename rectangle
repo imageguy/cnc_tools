@@ -52,6 +52,8 @@ if x_dim >= y_dim:
 	# tool moves in rows
 	n_x = 1
 	n_y = int(math.ceil( y_dim / eff_tool_diam )) 
+	if n_y == 0:
+		n_y = 1
 	eff_tool_diam = y_dim / n_y
 	x_len = x_dim
 	y_len = eff_tool_diam
@@ -59,6 +61,8 @@ if x_dim >= y_dim:
 else:
 	# tool moves in columns
 	n_x = int(math.ceil( x_dim / eff_tool_diam )) 
+	if n_x == 0:
+		n_x = 1
 	n_y = 1
 	eff_tool_diam = x_dim / n_x
 	x_len = eff_tool_diam
